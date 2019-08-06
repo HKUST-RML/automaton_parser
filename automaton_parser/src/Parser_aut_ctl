@@ -1,0 +1,155 @@
+#!/usr/bin/env python
+import re
+import os 
+import rospy
+from std_msgs.msg import String
+
+rospy.init_node('parser', anonymous=True)
+#rate = rospy.Rate(10) # 10hz
+
+
+library = ['Regrasp', 'TipCW', 'TipCCW', 'Liftup', 'Putdown', 'Grasp']
+
+spc_file_name = raw_input("Please input the name of the spc file:")
+os.system ('gr1c -r '+spc_file_name) 
+os.system ('gr1c -t dot '+spc_file_name+' > '+re.sub(r"spc","", spc_file_name)+'dot') 
+
+f = open(spc_file_name, 'r')
+result = list()
+for line in open(spc_file_name):
+    line = f.readline()
+    if re.search('ENV\:', line) != None:
+        line = re.sub(r"ENV\:","", line)
+        ENV=re.split('\W+', line)
+        ENV = sorted([i for i in ENV if i != ''])
+        #print ENV
+    if re.search('SYS\:', line) != None:
+        line = re.sub(r"SYS\:","", line)
+        SYS=re.split('\W+', line)
+        SYS = sorted([i for i in SYS if i != ''])
+        #print SYS
+
+
+with open(re.sub(r"spc","", spc_file_name)+'dot', 'r') as f:
+    data = f.read()
+
+a = re.sub(r"[0-9]*\;\\n\([0-9]*\,\s[0-9]*\)\\n","", data)
+
+with open(re.sub(r"spc","", spc_file_name)+'dot', 'w') as f:
+    f.write(a)
+os.system ('dot -Tpng -O '+re.sub(r"spc","", spc_file_name)+'dot') 
+
+
+f = open(re.sub(r"spc","", spc_file_name)+'dot', 'r')
+result = list()
+ini_cond = list()
+for line in open(re.sub(r"spc","", spc_file_name)+'dot'):
+    line = f.readline()
+    line = re.sub(r"\"","", line)
+    line = re.sub(r"\n","", line)
+    line = line.replace(' ','')
+#    print line+'\n'
+    if re.search('->', line) != None:
+        result.append(line)
+    if re.match('->', line) != None:
+        ini_cond.append(sorted(re.split('\W+', line.replace('->',''))))
+
+
+def extract_next_state(current_system_state, observed_environment):
+    current_system_state = ",".join(sorted(current_system_state))
+    observed_environment = ",".join(sorted(observed_environment))
+    if observed_environment == '':
+        before_arrow = current_system_state+'->'
+    elif current_system_state == '':
+        before_arrow = observed_environment+'->'
+    else:
+        before_arrow = observed_environment+','+current_system_state+'->'
+    #print before_arrow
+    next_step = list()
+    for e in result:
+        e_temp = re.sub(r"->.*$","", e)
+        e_temp = sorted(re.split('\W+', e_temp))
+        e_temp_env = sorted([i for i in e_temp if i in ENV])
+        e_temp_sys = sorted([i for i in e_temp if i in SYS])
+        e_temp = ",".join(e_temp_env + e_temp_sys)+'->'
+        if (observed_environment != '' and current_system_state != '' and re.match(before_arrow, e_temp) != None) or ((observed_environment == '' or current_system_state == '') and re.match(before_arrow, e_temp) != None):
+            e = re.sub(r"^.*->","", e)
+            next_step.append(e)
+    next_step_split = list()
+    for case in next_step:
+        next_step_split.append(sorted(re.split('\W+', case)))
+    return next_step_split
+
+def decide_action(new_observed_environment, next_step_split):
+    print 'new_emv', new_observed_environment
+    for next_state in next_step_split:
+        next_state_environment = sorted([i for i in next_state if i in ENV])
+        if sorted(new_observed_environment) == next_state_environment:
+            next_system_state = sorted([i for i in next_state if i in SYS])
+            return next_system_state
+    #print "The input is error"
+
+
+def callback(data):
+    global whether_finish
+    if data.data == 'Yes':
+        whether_finish = 'Yes'
+
+def subsrcibe_environment(environment):
+    global current_environment
+    current_environment = environment.data
+    #print 'current_environment', current_environment
+
+
+def parsing_and_executing():
+    global whether_finish, current_environment
+    
+    #print current_environment
+    #print str(current_environment)
+    ini_env_act = sorted(re.split('\W+', current_environment+" IsStable"))
+    
+    if ini_env_act in ini_cond:
+          current_system_state = sorted([i for i in ini_env_act if i in SYS])
+          current_observed_environment = sorted([i for i in ini_env_act if i in ENV])
+          while True:
+              current_action = [i for i in current_system_state if i in library]
+              print "current action",current_action
+              if (current_action != []):
+                  pubaction.publish(current_action[0])
+                  print current_action[0]
+                  whether_finish = 'No'
+                  while True:
+                      
+                      #whether_finish = raw_input("Is the current action finished? (Please input 'Yes' or 'No'.)")
+                      if whether_finish == 'Yes':   
+                          break
+                  whether_finish = 'No'
+                  next_state = extract_next_state(current_system_state, current_observed_environment)
+                  current_observed_environment = re.split('\W+', current_environment+" IsStable")
+                  current_observed_environment = sorted([i for i in current_observed_environment if i != ''])
+                  current_system_state = sorted(decide_action(current_observed_environment, next_state))
+              else:
+                  next_state = extract_next_state(current_system_state, current_observed_environment)
+                  current_system_state = decide_action(current_observed_environment, next_state)                  
+    else:
+          print ini_env_act
+          print "The input is wrong"
+
+if __name__ == '__main__':
+    try:
+        while True:
+            Pub_Complete = raw_input("Executer Pub complete? (Input 'Yes' or 'No'):")
+            if Pub_Complete == 'Yes':
+                break
+        rospy.Subscriber("current_environment", String, subsrcibe_environment)
+        rospy.Subscriber("whether_finish", String, callback)
+        pubaction = rospy.Publisher('robot_action', String, queue_size=10)
+        print 'Pub complete'
+        while True:
+            Start_executing = raw_input("Start executing? (Input 'Yes' or 'No'):")
+            if Start_executing == 'Yes':
+                parsing_and_executing()
+                break
+    except rospy.ROSInterruptException:
+        pass
+

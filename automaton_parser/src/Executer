@@ -1,0 +1,364 @@
+#!/usr/bin/env python
+import rospy
+import math3d as m3d
+import urx
+import logging
+import os
+import time
+import tf
+import numpy as np
+from math import pi
+from std_msgs.msg import String
+from apriltags_ros.msg import AprilTagDetection, AprilTagDetectionArray
+from robotiq_2f_gripper_control.msg import _Robotiq2FGripper_robot_output as outputMsg
+from robotiq_2f_gripper_control.msg import _Robotiq2FGripper_robot_input  as inputMsg
+
+pub_whether_finish = rospy.Publisher('whether_finish', String, queue_size=10)
+pub_current_environment = rospy.Publisher('current_environment', String, queue_size = 40)
+gripper_pub = rospy.Publisher('Robotiq2FGripperRobotOutput', outputMsg.Robotiq2FGripper_robot_output, queue_size=10)
+print 'Pub complete'
+
+def gactive():
+    command = outputMsg.Robotiq2FGripper_robot_output();
+    command.rACT = 1
+    command.rGTO = 1
+    command.rSP  = 255
+    command.rFR  = 150					##force need to be adjusted later
+    gripper_pub.publish(command)
+    rospy.sleep(0.5)
+    return command
+
+###___Reset gripper___###
+def greset():
+    command = outputMsg.Robotiq2FGripper_robot_output();
+    command.rACT = 0
+    gripper_pub.publish(command)
+    rospy.sleep(0.5)
+
+###___Set position of gripper___###
+def gposition(degree):
+    command = outputMsg.Robotiq2FGripper_robot_output();
+    command.rACT = 1
+    command.rGTO = 1
+    command.rATR = 0
+    command.rPR = degree
+    command.rSP  = 0
+    command.rFR  = 150 ##force need to be adjusted later
+    gripper_pub.publish(command)
+
+
+# calculate the distance between a point C and a segment AB
+def CtoAB(A,B,C):
+    CA=list(map(lambda x: x[0]-x[1], zip(A, C)))
+    CB=list(map(lambda x: x[0]-x[1], zip(B, C)))
+    ABdistance = np.sqrt((A[0]-B[0])**2+(A[1]-B[1])**2)
+    return abs(np.cross(CA,CB))/ABdistance
+
+# calculate the foot of the perpendicular from C to AB
+def footCtoAB(A,B,C):
+    k=float(((C[0]-A[0])*(B[0]-A[0])+(C[1]-A[1])*(B[1]-A[1])))/float(((B[0]-A[0])*(B[0]-A[0])+(B[1]-A[1])*(B[1]-A[1])))
+    return [A[0]+k*(B[0]-A[0]), A[1]+k*(B[1]-A[1])]
+
+def go_to_home():
+    Hong_joint0 = pi*53.29/180
+    Hong_joint1 = -pi*137.28/180
+    Hong_joint2 = -pi*83.30/180
+    Hong_joint3 = -pi + ( -Hong_joint1 + -Hong_joint2 - pi)
+    Hong_joint4 = Hong_joint0
+    Hong_joint5 = -pi*0/180
+    
+    robHong.movej((Hong_joint0,Hong_joint1, Hong_joint2, Hong_joint3, Hong_joint4, Hong_joint5), 0.1, 0.1)
+
+def baseTtag_func(tag_id):
+    camera_pose = (0.7, -0.025, 0.076, -pi/2, 0, 0)
+    baseTcam = m3d.Transform(camera_pose) # base_link to camera_link
+    listener.waitForTransform("/usb_cam", tag_id, rospy.Time(0), rospy.Duration(4.0))
+    (cPt3,cRt3_q) = listener.lookupTransform('/usb_cam', tag_id, rospy.Time(0))
+    cRt3_e = tf.transformations.euler_from_quaternion(cRt3_q, axes='sxyz')
+    tag_pose = (cPt3[0], cPt3[1], cPt3[2], cRt3_e[0], cRt3_e[1], cRt3_e[2])
+    camTtag = m3d.Transform(tag_pose)
+    baseTtag_temp = m3d.Transform.get_pose_vector(baseTcam * camTtag)
+    baseTtag_temp[3:6] = 0
+    return baseTtag_temp
+
+# edge pair
+# Q1 Q3 Q7 Q5
+
+def cam_cb(tag):
+    global Q0,Q1,Q2,Q3,Q4,Q5,Q6,Q7,F1,F2,CoM,current_action,regrasp_case,edge_level,baseTtag,support_point,Q,current_Q, gripper_work, current_pivot
+    
+    baseTtag = list()
+    for i in range(11):
+        baseTtag.append(baseTtag_func('/april_tag_frame_id_'+str(i)))
+    for i in range(11):
+        baseTtag[i][0] = baseTtag[i][0]-0.00368343
+        baseTtag[i][2] = baseTtag[i][2]-0.00380834
+    Q0 = baseTtag[0]
+    Q1 = baseTtag[1]
+    Q2 = baseTtag[2]
+    Q3 = baseTtag[3]
+    Q4 = baseTtag[4]
+    Q5 = baseTtag[5]
+    Q6 = baseTtag[6]
+    Q7 = baseTtag[7]
+    F1 = baseTtag[8]
+    F2 = baseTtag[9]
+    CoM = baseTtag[10]
+
+    if gripper_work == False:
+        current_environment_temp = 'gbk'
+    else:
+        current_environment_temp = ''
+    lowest_point = baseTtag[0]
+    Q = False
+    left_tag = list()
+    height_threshold = 0.003
+    for i in range(8):
+        if baseTtag[i][0] < CoM[0]-0.003:
+            left_tag.append(baseTtag[i])
+        if baseTtag[i][2] < CoM[2]-0.003:
+            if baseTtag[i][0] > CoM[0]-0.01 and baseTtag[i][0] < CoM[0]+0.01:
+                Q = True
+                current_environment_temp = current_environment_temp+' '+'Q'+str(i)+' '
+
+                left_nearest = baseTtag[(i-1)%8]
+                right_nearest = baseTtag[(i+1)%8]
+                if (left_nearest[2] > baseTtag[i][2]-0.01 and left_nearest[2] < baseTtag[i][2]+0.01) and (right_nearest[2] > baseTtag[i][2]-0.01 and right_nearest[2] < baseTtag[i][2]+0.01):
+                    edge_level = True
+                    support_point = i
+                    if support_point == 2 or support_point == 6:
+                        if F1[2]<F2[2]:
+                            if F1[0] < CoM[0]:
+                                current_environment_temp = current_environment_temp+' mcwf '
+                            else:
+                                current_environment_temp = current_environment_temp+' mccwf '        
+                        else:
+                            if F2[0] < CoM[0]:
+                                current_environment_temp = current_environment_temp+' mcwf '
+                            else:
+                                current_environment_temp = current_environment_temp+' mccwf '
+                    else:
+                        beneath = False
+                    if baseTtag[i][2]< height_threshold or left_nearest[2]< height_threshold or right_nearest[2]< height_threshold:
+                        current_environment_temp = current_environment_temp+' cgo '
+                        contact_ground = True
+                    break
+                else:
+                    current_pivot = baseTtag[i]
+                    edge_level = False
+                    if current_pivot[2]< height_threshold:
+                        current_environment_temp = current_environment_temp+' cgo '
+                        contact_ground = True
+                    break
+
+            if baseTtag[i][2]<lowest_point[2]:
+                lowest_point = baseTtag[i]
+    if Q == False:
+        current_pivot = lowest_point
+        edge_level = False
+        if current_pivot[2]< height_threshold:
+            current_environment_temp = current_environment_temp+' cgo '
+            contact_ground = True
+
+        if left_tag !=[]:
+            left_nearest = left_tag[0]
+            left_nearest_distance = abs(left_tag[0][0]-CoM[0]) 
+            for j in range(len(left_tag)):
+                if abs(left_tag[j][0]-CoM[0])<left_nearest_distance:
+                    left_nearest = left_tag[j]
+            for i in range(8):
+                if np.linalg.norm(list(map(lambda x: x[0]-x[1], zip(left_nearest, baseTtag[i]))),ord=2)<0.000000000000000001:
+                    left_nearest_index = i
+            right_nearest_index = (left_nearest_index-1)%8
+            current_environment_temp = current_environment_temp + ' '+'l'+str(right_nearest_index)+' '
+            right_nearest = baseTtag[right_nearest_index]
+
+    if Q == False:
+        if left_nearest[2] < right_nearest[2]:
+            current_environment_temp = current_environment_temp+' mcwp '
+        elif left_nearest[2] > right_nearest[2]:
+            current_environment_temp = current_environment_temp+' mccwp '
+
+    pub_current_environment.publish(current_environment_temp)             
+    
+
+
+
+    threshold = 0.013
+    if current_action == 'Regrasp': 
+        print 'rc', regrasp_case
+        print CtoAB(Q1[0:3:2],Q3[0:3:2],F1[0:3:2])
+        
+        F1F2 = list(map(lambda x: x[0]-x[1], zip(F2[0:3:2], F1[0:3:2])))
+        F2F1 = list(map(lambda x: x[0]-x[1], zip(F1[0:3:2], F2[0:3:2])))
+        F1foot = footCtoAB(Q7[0:3:2],Q5[0:3:2],F1[0:3:2])
+        F2foot = footCtoAB(Q1[0:3:2],Q3[0:3:2],F2[0:3:2])
+        print np.cross(F2F1,F2foot)
+        if (regrasp_case == 'A' and CtoAB(Q7[0:3:2],Q5[0:3:2],F2[0:3:2])<threshold and np.cross(F1F2,F1foot)<0.02) or (regrasp_case == 'B' and CtoAB(Q7[0:3:2],Q5[0:3:2],F2[0:3:2])<threshold and np.cross(F1F2,F1foot)>-0.02) or (regrasp_case == 'C' and CtoAB(Q1[0:3:2],Q3[0:3:2],F1[0:3:2])<threshold and np.cross(F2F1,F2foot)<0.02) or (regrasp_case == 'D' and CtoAB(Q1[0:3:2],Q3[0:3:2],F1[0:3:2])<threshold and np.cross(F2F1,F2foot)>-0.02):
+            print 'stop'
+            robHong.stopl(acc=0.5)
+            pub_whether_finish.publish('Yes')
+            regrasp_case = 'false'
+            current_action = 'false'
+
+    if current_action == 'Putdown':
+        if contact_ground == True:
+            robHong.stopl(acc=0.5)
+            pub_whether_finish.publish('Yes')
+            current_action = 'false'
+
+    if current_action == 'TipCCW' or current_action == 'TipCW':
+        if Q != current_Q:
+            robHong.stopl(acc=0.5)
+            pub_whether_finish.publish('Yes')
+            current_action = 'false'
+
+    if current_action == 'Grasp':
+        if gripper_work == False:
+            if (CtoAB(Q1[0:3:2],Q3[0:3:2],F1[0:3:2])<0.015 and CtoAB(Q7[0:3:2],Q5[0:3:2],F2[0:3:2])<0.015):
+                robHong.stopl(acc=0.5)
+                pub_whether_finish.publish('Yes')
+                current_action = 'false'
+        
+        
+def move_ref(target_ref_transform, ref_frame):
+    frame_to_tcp = m3d.Transform.get_inverse(robHong.get_pose().inverse * m3d.Transform(ref_frame))
+    temp1 = m3d.Transform(frame_to_tcp)
+    temp2 = m3d.Transform(target_ref_transform)
+    delta_rotation = temp1.orient.inverse * temp2.orient * temp1.orient
+    delta_translation = temp2.pos + temp2.orient*temp1.pos - temp1.pos
+    Delta_tcp = m3d.Transform()
+    Delta_tcp.orient = delta_rotation
+    Delta_tcp.pos = frame_to_tcp.orient.inverse * delta_translation
+    robHong.movel_tool(m3d.Transform.get_pose_vector(Delta_tcp), acc=0.1, vel=0.02)
+
+
+def callback(data):
+    global current_action, regrasp_case,Q0,Q1,Q2,Q3,Q4,Q5,Q6,Q7,F1,F2, edge_level,baseTtag,support_point,Q,current_Q , gripper_work, current_pivot
+    current_action = 'false'
+    regrasp_case = 'false'
+    if data.data == 'Regrasp':
+        print 'Current action: Regrasp'
+        current_action = 'Regrasp'
+        F1_current = F1
+        F2_current = F2
+        Q7_current = Q7
+        Q5_current = Q5
+        Q1_current = Q1
+        Q3_current = Q3
+        F1F2 = list(map(lambda x: x[0]-x[1], zip(F2_current[0:3:2], F1_current[0:3:2])))
+        F2F1 = list(map(lambda x: x[0]-x[1], zip(F1_current[0:3:2], F2_current[0:3:2])))
+        F1foot = footCtoAB(Q7_current[0:3:2], Q5_current[0:3:2], F1_current[0:3:2])
+        F2foot = footCtoAB(Q1_current[0:3:2], Q3_current[0:3:2], F2_current[0:3:2])
+        F1contact = footCtoAB(Q1_current[0:3:2], Q3_current[0:3:2], F1_current[0:3:2])
+        F2contact = footCtoAB(Q7_current[0:3:2], Q5_current[0:3:2], F2_current[0:3:2])
+        if F1_current[2] < F1contact[1]:
+            if np.cross(F1F2,F1foot)>0:
+                regrasp_case = 'A'
+                print 'A'
+                move_ref((0,0,0,0,pi/2,0), F1_current)
+
+            else:
+                regrasp_case = 'B'
+                print 'B'
+                move_ref((0,0,0,0,-pi/2,0), F1_current)
+        else:
+            if np.cross(F2F1,F2foot)>0:
+                regrasp_case = 'C'
+                print 'C'
+                move_ref((0,0,0,0,pi/2,0), F2_current)
+
+            else:
+                regrasp_case = 'D'
+                print 'D'
+                move_ref((0,0,0,0,-pi/2,0), F2_current)
+
+
+    elif data.data == 'TipCCW':
+        print 'Current action: TipCCW'
+        current_action = 'TipCCW'
+        current_Q = Q
+        if edge_level == True:
+            temp = baseTtag[(support_point+1)%8]
+        else:
+            temp = current_pivot
+        temp[2] = temp[2] - 0.005
+        move_ref((0,0,0,0,-pi/2,0), temp)     
+
+    elif data.data == 'TipCW':
+        print 'Current action: TipCW'
+        current_action = 'TipCW'
+        current_Q = Q
+        if edge_level == True:
+            temp = baseTtag[(support_point-1)%8]
+        else:
+            temp = current_pivot
+        temp[2] = temp[2] - 0.005
+        move_ref((0,0,0,0,pi/2,0), temp) 
+
+    elif data.data == 'Liftup':
+        print 'Current action: Liftup'
+        current_action = 'Liftup'
+        robHong.translate((0, 0, 0.10), acc=0.1, vel=0.02)
+        pub_whether_finish.publish('Yes')
+        current_action = 'false'
+    elif data.data == 'Putdown':
+        print 'Current action: Putdown'
+        current_action = 'Putdown'
+        robHong.translate((0, 0, -0.13), acc=0.1, vel=0.02)
+        
+    elif data.data == 'Grasp':
+        print 'Current action: Grasp'
+        current_action = 'Grasp'
+        if gripper_work == False:
+            robHong.movel_tool((0, 0, 0, 0, 0, -pi/2), acc=0.1, vel=0.02)
+        else:
+            gposition(130)
+            rospy.sleep(0.5)
+            pub_whether_finish.publish('Yes')
+            current_action = 'false'
+        
+    else:
+        print 'There is an error'
+        os._exit(0)
+
+
+if __name__ == '__main__':
+    global current_action, F1, F2, gripper_work
+    rospy.init_node('executer', anonymous=True)
+    robHong = urx.Robot("192.168.1.102")
+    logging.basicConfig(level=logging.WARN)
+    robHong.set_tcp((0, 0, 0, 0, 0, 0))
+    listener = tf.TransformListener()
+    gripper_work = False   
+    current_action = 'false'
+    while True:
+        Pub_Complete = raw_input("Parser_aut_ctl Pub complete? (Input 'Yes' or 'No'):")
+        if Pub_Complete == 'Yes':
+            break
+    rospy.Subscriber('/tag_detections', AprilTagDetectionArray, cam_cb, queue_size=10)
+    rospy.Subscriber('robot_action', String, callback)
+    
+    go_to_home()
+    robHong.translate((-0.045, 0, 0), acc=0.1, vel=0.02)
+    robHong.translate((0, -0.015, 0), acc=0.1, vel=0.02)
+    robHong.translate((0, 0, 0.03), acc=0.1, vel=0.02)
+    
+    print 'home'
+    gposition(0)
+    rospy.sleep(0.5)
+    F1F2distance_ori = np.sqrt((F1[0]-F2[0])**2+(F1[2]-F2[2])**2)
+    
+    gposition(110)
+    rospy.sleep(0.5)
+    F1F2distance = np.sqrt((F1[0]-F2[0])**2+(F1[2]-F2[2])**2)
+    #print abs(F1F2distance - F1F2distance_ori)
+    if abs(F1F2distance - F1F2distance_ori) > 0.01:
+        gripper_work = True
+    else:
+        gripper_work = False    
+    print 'Robot action callback'
+    
+    
+    
+    rospy.spin()
